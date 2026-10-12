@@ -15,15 +15,15 @@
 
 	"type": "module",
 	"name": "global-launch-options",
-	"version": "1.1.0",
+	"version": "2.0.0",
 	"description": "A plugin that automatically applies custom launch options globally across all your Steam games.",
 	"main": "./frontend/index.tsx",
-	"author": "BlafKing",
+	"author": "BlafKing and JJohnson1988",
 	"license": "MIT",
 	"keywords": ["millennium", "steam", "launch-options", "global", "plugin"],
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/BlafKing/steam-global-launch-options.git"
+		"url": "https://github.com/JJohnson1988/steam-global-launch-options.git"
 	},
 
 	"dependencies": {
