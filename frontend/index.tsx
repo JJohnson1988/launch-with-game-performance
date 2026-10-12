@@ -1,25 +1,11 @@
 import { definePlugin, Field, TextField, IconsModule } from '@steambrew/client';
 import React, { useState, useEffect } from 'react';
 
-// JSX namespace declaration for JSX factory
-declare global {
-	namespace JSX {
-		interface IntrinsicElements {
-			[elemName: string]: any;
-		}
-	}
-}
-
 // Plugin state tracking
 let hooksInjected = false;
 
 // Plugin configuration with defaults
-interface PluginConfig {
-	globalLaunchOptions: string;
-	excludedGameIds: string;
-}
-
-let pluginConfig: PluginConfig = {
+let pluginConfig = {
 	globalLaunchOptions: '',
 	excludedGameIds: ''
 };
@@ -28,105 +14,147 @@ const plugin = {
 	prefix: '%cGlobal Launch Options%c',
 	style: 'color: #cdd6f4; background-color: #746292; padding: 2px 4px; border-radius: 3px;',
 
-	log(...args: any[]): void {
+	log(...args) {
 		console.log(plugin.prefix, plugin.style, '', ...args);
 	},
 
-	error(...args: any[]): void {
+	warn(...args) {
+		console.warn(plugin.prefix, plugin.style, '', ...args);
+	},
+
+	error(...args) {
 		console.error(plugin.prefix, plugin.style, '', ...args);
 	},
 };
 
 /**
  * Gets the current configuration from memory
- * @returns Current plugin configuration object
  */
 function getCurrentConfig() {
 	return pluginConfig;
 }
 
 /**
- * Retrieves current launch options for a specific Steam app
- * Uses Steam's RegisterForAppDetails API to get real-time app data
- * @param appId - Steam App ID as string
- * @returns Promise resolving to current launch options string
+ * Retrieves current launch options for a specific Steam app safely with resolution guards
  */
-async function getCurrentLaunchOptions(appId: string): Promise<string> {
+async function getCurrentLaunchOptions(appId) {
 	return new Promise((resolve, reject) => {
-		try {
-			const numericAppId = parseInt(appId);
+		let isResolved = false;
+		const numericAppId = parseInt(appId);
 
-			// Register for app details callback
-			const unregister = window.SteamClient.Apps.RegisterForAppDetails(numericAppId, (appDetails) => {
-				try {
-					const launchOptions = appDetails.strLaunchOptions || '';
-					unregister.unregister();
-					resolve(launchOptions);
-				} catch (error) {
-					unregister.unregister();
-					reject(error);
-				}
-			});
-
-			// Timeout protection in case callback never fires
-			setTimeout(() => {
+		const unregister = window.SteamClient.Apps.RegisterForAppDetails(numericAppId, (appDetails) => {
+			if (isResolved) return;
+			isResolved = true;
+			try {
+				const launchOptions = appDetails.strLaunchOptions || '';
 				unregister.unregister();
-				reject(new Error(`Timeout waiting for app details for app ${appId}`));
-			}, 5000);
+				resolve(launchOptions);
+			} catch (error) {
+				unregister.unregister();
+				reject(error);
+			}
+		});
 
-		} catch (error) {
-			reject(error);
-		}
+		setTimeout(() => {
+			if (isResolved) return;
+			isResolved = true;
+			unregister.unregister();
+			reject(new Error(`Timeout waiting for app details for app ${appId}`));
+		}, 5000);
 	});
 }
 
-interface ParsedLaunchOptions {
-	preCommand: string[];   // Environment vars and wrappers (before %command%)
-	postCommand: string[];  // Game executable arguments (after %command%)
-	hasCommand: boolean;    // Whether %command% placeholder was present
+/**
+ * Quote-aware argument tokenizer for Linux shell strings.
+ * Preserves single and double quotes so spaces inside scripts/arguments don't break them.
+ */
+function tokenizeArgs(input) {
+	const tokens = [];
+	let current = '';
+	let inSingleQuote = false;
+	let inDoubleQuote = false;
+	let escaped = false;
+
+	for (let i = 0; i < input.length; i++) {
+		const char = input[i];
+		if (escaped) {
+			current += char;
+			escaped = false;
+			continue;
+		}
+		if (char === '\\') {
+			escaped = true;
+			current += char;
+			continue;
+		}
+		if (char === '\'' && !inDoubleQuote) {
+			inSingleQuote = !inSingleQuote;
+			current += char;
+			continue;
+		}
+		if (char === '"' && !inSingleQuote) {
+			inDoubleQuote = !inDoubleQuote;
+			current += char;
+			continue;
+		}
+		if (/\s/.test(char) && !inSingleQuote && !inDoubleQuote) {
+			if (current.trim().length > 0) {
+				tokens.push(current.trim());
+				current = '';
+			}
+			continue;
+		}
+		current += char;
+	}
+	if (current.trim().length > 0) {
+		tokens.push(current.trim());
+	}
+	return tokens;
 }
 
 /**
- * Parses launch options string into structured components
- * Launch options format: [pre-command] %command% [post-command]
- * - Pre-command: Environment variables, wrappers (e.g., MANGOHUD=1, gamemoderun)
- * - %command%: Placeholder for game executable (should appear only once)
- * - Post-command: Game arguments (e.g., -novid, -windowed)
- * 
- * @param options - Raw launch options string
- * @returns Parsed launch options structure
+ * Parses launch options string into structured components using quote-aware tokenization.
  */
-function parseLaunchOptions(options: string): ParsedLaunchOptions {
+function parseLaunchOptions(options) {
 	if (!options.trim()) {
-		return { preCommand: [], postCommand: [], hasCommand: false };
+		return { envVars: [], preArgs: [], postCommand: [], hasCommand: false };
 	}
 
 	const parts = options.split('%command%');
 
+	const classifyPreCommand = (preStr) => {
+		const tokens = tokenizeArgs(preStr);
+		const envVars = [];
+		const preArgs = [];
+
+		for (const token of tokens) {
+			// Top-level environment variable assignment (must not be enclosed in quotes)
+			if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token) && !token.startsWith("'") && !token.startsWith('"')) {
+				envVars.push(token);
+			} else {
+				preArgs.push(token);
+			}
+		}
+		return { envVars, preArgs };
+	};
+
 	if (parts.length === 1) {
-		// No %command% found - treat as post-command arguments
 		return {
-			preCommand: [],
-			postCommand: parts[0].trim().split(/\s+/).filter(p => p.length > 0),
+			envVars: [],
+			preArgs: [],
+			postCommand: tokenizeArgs(parts[0]),
 			hasCommand: false
 		};
-	} else if (parts.length === 2) {
-		// Normal case: single %command% found
-		const preCommand = parts[0].trim().split(/\s+/).filter(p => p.length > 0);
-		const postCommand = parts[1].trim().split(/\s+/).filter(p => p.length > 0);
-
-		return {
-			preCommand,
-			postCommand,
-			hasCommand: true
-		};
 	} else {
-		// Multiple %command% found - merge post-command parts
-		const preCommand = parts[0].trim().split(/\s+/).filter(p => p.length > 0);
-		const postCommand = parts.slice(1).join(' ').trim().split(/\s+/).filter(p => p.length > 0);
+		const preStr = parts[0];
+		const postStr = parts.slice(1).join('%command%');
+		
+		const pre = classifyPreCommand(preStr);
+		const postCommand = tokenizeArgs(postStr);
 
 		return {
-			preCommand,
+			envVars: pre.envVars,
+			preArgs: pre.preArgs,
 			postCommand,
 			hasCommand: true
 		};
@@ -134,92 +162,86 @@ function parseLaunchOptions(options: string): ParsedLaunchOptions {
 }
 
 /**
- * Intelligently merges original app launch options with global launch options
- * Ensures proper ordering and prevents duplicate %command% placeholders
- * Removes duplicate environment variables and arguments
- * 
- * @param originalOptions - Current launch options for the app
- * @param globalOptions - Global launch options to apply
- * @returns Merged launch options string
+ * Intelligently merges original app launch options with global launch options,
+ * ensuring Linux environment variables come first, followed by wrappers/shell code,
+ * followed by %command% and game-specific post-commands.
  */
-function mergeLaunchOptions(originalOptions: string, globalOptions: string): string {
+function mergeLaunchOptions(originalOptions, globalOptions) {
 	const original = parseLaunchOptions(originalOptions);
 	const global = parseLaunchOptions(globalOptions);
 
-	// Helper function to deduplicate array while preserving order (keeping first occurrence)
-	const deduplicateArray = (arr: string[]): string[] => {
-		const seen = new Set<string>();
+	const deduplicateArray = (arr) => {
+		const seen = new Set();
 		return arr.filter(item => {
-			if (seen.has(item)) {
-				return false;
-			}
+			if (seen.has(item)) return false;
 			seen.add(item);
 			return true;
 		});
 	};
 
-	// Combine pre-command parts (environment vars, wrappers) with global options taking precedence
-	// By putting global first, we ensure global settings override game-specific ones
-	const combinedPreCommand = deduplicateArray([...global.preCommand, ...original.preCommand]);
-
-	// Combine post-command parts (game arguments) with game-specific taking precedence
-	// Game-specific arguments should come first to allow them to override global ones
+	const combinedEnvVars = deduplicateArray([...global.envVars, ...original.envVars]);
+	const combinedPreArgs = deduplicateArray([...global.preArgs, ...original.preArgs]);
 	const combinedPostCommand = deduplicateArray([...original.postCommand, ...global.postCommand]);
 
-	// Build final launch options string
-	let result = '';
+	let resultParts = [];
 
-	// Add pre-command parts
-	if (combinedPreCommand.length > 0) {
-		result += combinedPreCommand.join(' ');
+	// 1. Environment variables MUST come first on Linux
+	if (combinedEnvVars.length > 0) {
+		resultParts.push(combinedEnvVars.join(' '));
 	}
 
-	// Add %command% if needed (always include if we have pre-command parts)
-	if (original.hasCommand || global.hasCommand || combinedPreCommand.length > 0) {
-		result += (result ? ' ' : '') + '%command%';
+	// 2. Wrappers, binaries, and shell options come next
+	if (combinedPreArgs.length > 0) {
+		resultParts.push(combinedPreArgs.join(' '));
 	}
 
-	// Add post-command parts
+	// 3. Include %command% placeholder if present or needed
+	if (original.hasCommand || global.hasCommand || resultParts.length > 0) {
+		resultParts.push('%command%');
+	}
+
+	// 4. Game-specific post-command arguments
 	if (combinedPostCommand.length > 0) {
-		result += (result ? ' ' : '') + combinedPostCommand.join(' ');
+		resultParts.push(combinedPostCommand.join(' '));
 	}
 
-	return result;
+	return resultParts.join(' ');
 }
 
-
-
 /**
- * Injects hooks into Steam's game launch process
- * Uses RegisterForGameActionUserRequest to detect launches from any source
+ * Injects hooks into Steam's game launch process using action-ID mapping
  */
 function injectLaunchHooks() {
 	if (hooksInjected) return;
-	plugin.log('Injecting launch hooks...');
+	plugin.log('Injecting robust launch hooks...');
 
-	// Track current launching app and its original launch options
-	let currentLaunchingAppId: string | null = null;
-	let originalLaunchOptions: string | null = null;
-	// Track pending restore operations (appId -> {timeout, originalOptions})
-	const pendingRestores = new Map<string, { timeoutId: number, originalOptions: string }>();
+	const activeLaunches = new Map();
 
-	// Register for game action end - fires when a game closes
+	const restoreLaunchOptions = (gameActionId) => {
+		const launch = activeLaunches.get(gameActionId);
+		if (!launch) return;
+
+		clearTimeout(launch.timeoutId);
+		try {
+			window.SteamClient.Apps.SetAppLaunchOptions(
+				parseInt(launch.appId),
+				launch.originalOptions
+			);
+			plugin.log(`Restored launch options for app ${launch.appId} (Action ID: ${gameActionId})`);
+		} catch (e) {
+			plugin.error(`Failed to restore launch options for app ${launch.appId}:`, e);
+		} finally {
+			activeLaunches.delete(gameActionId);
+		}
+	};
+
 	if (window.SteamClient?.Apps?.RegisterForGameActionEnd) {
-		window.SteamClient.Apps.RegisterForGameActionEnd(() => {
-			// Check if we have any pending restores to clean up
-			
-			for (const [appId, restore] of pendingRestores.entries()) {
-				// Restore immediately on game launch end
-				try {
-					window.SteamClient.Apps.SetAppLaunchOptions(
-						parseInt(appId),
-						restore.originalOptions
-					);
-					clearTimeout(restore.timeoutId);
-					pendingRestores.delete(appId);
-					plugin.log(`Restored launch options for app ${appId} on game launch end`);
-				} catch (e) {
-					plugin.error(`Failed to restore launch options for app ${appId}:`, e);
+		window.SteamClient.Apps.RegisterForGameActionEnd((gameActionId) => {
+			if (gameActionId !== undefined && activeLaunches.has(gameActionId)) {
+				restoreLaunchOptions(gameActionId);
+			} else {
+				for (const [id] of activeLaunches.entries()) {
+					restoreLaunchOptions(id);
 				}
 			}
 		});
@@ -228,103 +250,70 @@ function injectLaunchHooks() {
 		plugin.error('RegisterForGameActionEnd API not available');
 	}
 
-	// Register for game action user requests - this fires for ALL launch sources
-	// (Steam UI, desktop shortcuts, Steam URLs, etc.)
 	if (window.SteamClient?.Apps?.RegisterForGameActionUserRequest) {
-		window.SteamClient.Apps.RegisterForGameActionUserRequest((_gameActionId, appId, action, _requestedAction, _appId2) => {
-			// Only process LaunchApp actions
-			if (action !== 'LaunchApp') {
-				return;
-			}
+		window.SteamClient.Apps.RegisterForGameActionUserRequest((gameActionId, appId, action) => {
+			if (action !== 'LaunchApp') return;
 
 			const config = getCurrentConfig();
-
-			// Check if app is in exclusion list
 			const excludedAppIds = config.excludedGameIds
-				? config.excludedGameIds.split(',').map((id: string) => id.trim())
+				? config.excludedGameIds.split(',').map((id) => id.trim())
 				: [];
 
 			if (excludedAppIds.includes(appId.toString())) {
-				currentLaunchingAppId = null;
-				plugin.log(`App ${appId} is excluded from global launch options, skipping modifications.`);
-			} else {
-				currentLaunchingAppId = appId;
-				plugin.log(`Launching app ${appId}`);
+				plugin.log(`App ${appId} is excluded from global launch options.`);
+				return;
 			}
-		});
 
+			activeLaunches.set(gameActionId, {
+				appId: appId.toString(),
+				originalOptions: '',
+				timeoutId: 0
+			});
+			plugin.log(`Tracked launch intent for app ${appId} (Action ID: ${gameActionId})`);
+		});
 		plugin.log('Registered for GameActionUserRequest events');
 	} else {
 		plugin.error('RegisterForGameActionUserRequest API not available');
 	}
 
-	// Hook Steam's ContinueGameAction to modify launch options during game start
-	if (window.SteamClient && window.SteamClient.Apps && window.SteamClient.Apps.ContinueGameAction) {
+	if (window.SteamClient?.Apps?.ContinueGameAction) {
 		const originalContinueGameAction = window.SteamClient.Apps.ContinueGameAction;
-		window.SteamClient.Apps.ContinueGameAction = async function (gameActionId: number, action: string) {
-			// Intercept when Steam is creating the game process
-			if (action === 'CreatingProcess' && currentLaunchingAppId) {
+		window.SteamClient.Apps.ContinueGameAction = async function (gameActionId, action) {
+			if (action === 'CreatingProcess' && activeLaunches.has(gameActionId)) {
+				const launch = activeLaunches.get(gameActionId);
 				const config = getCurrentConfig();
 
 				if (config.globalLaunchOptions) {
 					try {
-						// Step 1: Fetch original launch options
-						originalLaunchOptions = await getCurrentLaunchOptions(currentLaunchingAppId);
-						plugin.log(`Original launch options: "${originalLaunchOptions}"`);
+						launch.originalOptions = await getCurrentLaunchOptions(launch.appId);
+						plugin.log(`Original launch options for app ${launch.appId}: "${launch.originalOptions}"`);
 
-						// Step 2: Merge with global options
-						const mergedOptions = mergeLaunchOptions(originalLaunchOptions, config.globalLaunchOptions);
-						plugin.log(`Launching with: "${mergedOptions}"`);
+						const mergedOptions = mergeLaunchOptions(launch.originalOptions, config.globalLaunchOptions);
+						plugin.log(`Launching with merged options: "${mergedOptions}"`);
 
-						// Step 3: Apply merged options for launch
 						window.SteamClient.Apps.SetAppLaunchOptions(
-							parseInt(currentLaunchingAppId),
+							parseInt(launch.appId),
 							mergedOptions
 						);
 
-						// Step 4: Schedule restoration with timeout as fallback
-						const appIdToRestore = currentLaunchingAppId;
-						const optionsToRestore = originalLaunchOptions;
-
-						// Clear any existing pending restore for this app
-						if (pendingRestores.has(appIdToRestore)) {
-							clearTimeout(pendingRestores.get(appIdToRestore)!.timeoutId);
-						}
-
-						// Set up timeout fallback (in case GameActionEnd doesn't fire)
-						const timeoutId = window.setTimeout(() => {
-							try {
-								window.SteamClient.Apps.SetAppLaunchOptions(
-									parseInt(appIdToRestore),
-									optionsToRestore
-								);
-								pendingRestores.delete(appIdToRestore);
-								plugin.log(`Restored launch options for app ${appIdToRestore} (timeout fallback)`);
-							} catch (e) {
-								plugin.error('Failed to restore launch options:', e);
-							}
-						}, 20000);
-
-						// Track this restore operation
-						pendingRestores.set(appIdToRestore, {
-							timeoutId,
-							originalOptions: optionsToRestore
-						});
+						launch.timeoutId = window.setTimeout(() => {
+							plugin.warn(`Restore timeout reached for app ${launch.appId}, forcing restore.`);
+							restoreLaunchOptions(gameActionId);
+						}, 30000);
 
 					} catch (e) {
-						plugin.error('Error processing launch options:', e);
+						plugin.error('Error processing launch options during process creation:', e);
+						activeLaunches.delete(gameActionId);
 					}
 				} else {
 					plugin.log('No global options configured.');
+					activeLaunches.delete(gameActionId);
 				}
-
-				// Clean up tracking variables
-				currentLaunchingAppId = null;
-				originalLaunchOptions = null;
 			}
 
 			return originalContinueGameAction.call(this, gameActionId, action);
 		};
+		plugin.log('Hooked ContinueGameAction successfully');
 	}
 
 	hooksInjected = true;
@@ -334,7 +323,7 @@ function injectLaunchHooks() {
 /**
  * Settings component for the in-steam config UI
  */
-const SingleSetting = (props: { name: keyof PluginConfig; type: string; label: string; description: string; }) => {
+const SingleSetting = (props) => {
 	const [textValue, setTextValue] = useState('');
 
 	const saveConfig = () => {
@@ -349,79 +338,75 @@ const SingleSetting = (props: { name: keyof PluginConfig; type: string; label: s
 	}, []);
 
 	if (props.type === "text") {
-		return (
-			<Field label={props.label} description={props.description} bottomSeparator="standard" focusable>
-				<TextField 
-					value={textValue} 
-					onChange={(e: React.ChangeEvent<HTMLInputElement>) => { 
-						const value = e.currentTarget.value;
-						setTextValue(value);
-						pluginConfig[props.name] = value; 
-						saveConfig(); 
-					}} 
-				/>
-			</Field>
-		);
+		return React.createElement(Field, { 
+			label: props.label, 
+			description: props.description, 
+			bottomSeparator: "standard", 
+			focusable: true 
+		}, React.createElement(TextField, { 
+			value: textValue, 
+			onChange: (e) => { 
+				const value = e.currentTarget.value;
+				setTextValue(value);
+				pluginConfig[props.name] = value; 
+				saveConfig(); 
+			} 
+		}));
 	}
 	return null;
 };
 
 const SettingsContent = () => {
-	return (
-		<>
-			<style>{`
-				.DialogInput_Wrapper._DialogLayout.Panel {
-					width: 100%;
-					max-width: 400px;
-				}
-				div:has(> .DialogInput_Wrapper._DialogLayout.Panel) {
-					justify-content: flex-end;
-				}
-				.global-launch-options-settings > div > div > div:nth-child(1) {
-					flex-grow: 0 !important;
-				}
-				.global-launch-options-settings > div > div > div:nth-child(2) {
-					flex-grow: 1;
-				}
-			`}</style>
-			<div className="global-launch-options-settings">
-				<SingleSetting 
-					name="globalLaunchOptions" 
-					type="text" 
-					label="Global Launch Options" 
-					description="Launch options to apply to all games (e.g., MANGOHUD=1 %command%). Use %command% as placeholder for the game executable." 
-				/>
-				<SingleSetting 
-					name="excludedGameIds" 
-					type="text" 
-					label="Excluded Game IDs" 
-					description="Comma-separated list of Steam App IDs to exclude from global launch options (e.g., 570,730,440)" 
-				/>
-			</div>
-		</>
+	return React.createElement(React.Fragment, null,
+		React.createElement("style", null, `
+			.DialogInput_Wrapper._DialogLayout.Panel {
+				width: 100%;
+				max-width: 400px;
+			}
+			div:has(> .DialogInput_Wrapper._DialogLayout.Panel) {
+				justify-content: flex-end;
+			}
+			.global-launch-options-settings > div > div > div:nth-child(1) {
+				flex-grow: 0 !important;
+			}
+			.global-launch-options-settings > div > div > div:nth-child(2) {
+				flex-grow: 1;
+			}
+		`),
+		React.createElement("div", { className: "global-launch-options-settings", style: { padding: '8px 0' } },
+			React.createElement(SingleSetting, { 
+				name: "globalLaunchOptions", 
+				type: "text", 
+				label: "Global Launch Options", 
+				description: "Launch options applied globally (e.g., MANGOHUD=1 bash -c 'export FOO=bar; %command%'). Use %command% as the executable placeholder." 
+			}),
+			React.createElement(SingleSetting, { 
+				name: "excludedGameIds", 
+				type: "text", 
+				label: "Excluded Game IDs", 
+				description: "Comma-separated list of Steam App IDs to exclude from global launch options (e.g., 570,730,440)" 
+			})
+		)
 	);
 };
 
 /**
  * Millennium plugin entry point
- * Initializes the global launch options plugin
  */
 export default definePlugin(() => {
 	plugin.log('Global Launch Options plugin initializing...');
 	
-	// Load configuration from localStorage
 	const storedConfig = JSON.parse(localStorage.getItem("global_launch_options.config") || "{}");
 	pluginConfig = { ...pluginConfig, ...storedConfig };
 	plugin.log('Loaded config:', pluginConfig);
 	
-	// Inject hooks on plugin load
 	setTimeout(injectLaunchHooks, 500);
 	
 	plugin.log('Plugin initialization complete');
 
 	return {
 		title: "Global Launch Options",
-		icon: <IconsModule.Settings />,
-		content: <SettingsContent />,
+		icon: React.createElement(IconsModule.Settings, null),
+		content: React.createElement(SettingsContent, null),
 	};
 });
