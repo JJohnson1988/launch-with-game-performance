@@ -1,11 +1,25 @@
 import { definePlugin, Field, TextField, IconsModule } from '@steambrew/client';
 import React, { useState, useEffect } from 'react';
 
+// JSX namespace declaration for JSX factory
+declare global {
+	namespace JSX {
+		interface IntrinsicElements {
+			[elemName: string]: any;
+		}
+	}
+}
+
 // Plugin state tracking
 let hooksInjected = false;
 
-// Plugin configuration with defaults
-let pluginConfig = {
+// Keep this in your index.tsx source file!
+interface PluginConfig {
+	globalLaunchOptions: string;
+	excludedGameIds: string;
+}
+
+let pluginConfig: PluginConfig = {
 	globalLaunchOptions: '',
 	excludedGameIds: ''
 };
