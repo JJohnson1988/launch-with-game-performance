@@ -128,13 +128,12 @@ function tokenizeArgs(input) {
 
 /**
  * Parses launch options string into structured components using quote-aware tokenization.
+ * Updated to safely handle wrappers/strings that omit %command%.
  */
 function parseLaunchOptions(options) {
 	if (!options.trim()) {
 		return { envVars: [], preArgs: [], postCommand: [], hasCommand: false };
 	}
-
-	const parts = options.split('%command%');
 
 	const classifyPreCommand = (preStr) => {
 		const tokens = tokenizeArgs(preStr);
@@ -152,27 +151,31 @@ function parseLaunchOptions(options) {
 		return { envVars, preArgs };
 	};
 
-	if (parts.length === 1) {
+	// If %command% is omitted entirely, treat the input as pre-arguments/wrapper 
+	// and set hasCommand to false so mergeLaunchOptions will safely append %command%.
+	if (!options.includes('%command%')) {
+		const classified = classifyPreCommand(options);
 		return {
-			envVars: [],
-			preArgs: [],
-			postCommand: tokenizeArgs(parts[0]),
+			envVars: classified.envVars,
+			preArgs: classified.preArgs,
+			postCommand: [],
 			hasCommand: false
 		};
-	} else {
-		const preStr = parts[0];
-		const postStr = parts.slice(1).join('%command%');
-		
-		const pre = classifyPreCommand(preStr);
-		const postCommand = tokenizeArgs(postStr);
-
-		return {
-			envVars: pre.envVars,
-			preArgs: pre.preArgs,
-			postCommand,
-			hasCommand: true
-		};
 	}
+
+	const parts = options.split('%command%');
+	const preStr = parts[0];
+	const postStr = parts.slice(1).join('%command%');
+	
+	const pre = classifyPreCommand(preStr);
+	const postCommand = tokenizeArgs(postStr);
+
+	return {
+		envVars: pre.envVars,
+		preArgs: pre.preArgs,
+		postCommand,
+		hasCommand: true
+	};
 }
 
 /**
