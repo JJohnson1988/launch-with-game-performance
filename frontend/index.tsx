@@ -4,6 +4,7 @@ let hooked = false;
 
 const plugin = {
 	prefix: '%cLaunch with game-performance tool%c',
+	style: 'color: #cdd6f4; background-color: #746292; padding: 2px 4px; border-radius: 3px;',
 	log(...args: any[]): void {
 		console.log(plugin.prefix, plugin.style, '', ...args);
 	},
